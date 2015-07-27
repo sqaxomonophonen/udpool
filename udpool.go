@@ -132,11 +132,11 @@ func main() {
 						for {
 							for i := 0; i < 2; i++ {
 								select {
-									case exit_status = <-exit_status_chan:
-										break Exit
-									case <-time.After(process_timeout_durations[i]):
-										log.Printf("%s %s %s %s", msg.sserial, signal_names[i], *server, msg.argument)
-										cmd.Process.Signal(signals[i])
+								case exit_status = <-exit_status_chan:
+									break Exit
+								case <-time.After(process_timeout_durations[i]):
+									log.Printf("%s %s %s %s", msg.sserial, signal_names[i], *server, msg.argument)
+									cmd.Process.Signal(signals[i])
 								}
 							}
 							exit_status = <-exit_status_chan
