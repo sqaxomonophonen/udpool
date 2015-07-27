@@ -167,6 +167,8 @@ func main() {
 		}(i)
 	}
 
+	drop_chan := make(chan int, 1)
+
 	go func() {
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
 		if err != nil {
@@ -188,9 +190,13 @@ func main() {
 			message := Message{ sserial: sserial, argument: arg }
 			log.Printf("%s ACPT %s", sserial, arg)
 			select {
+			case <-drop_chan:
+				log.Printf("%s DROP %s (reason: quitting)", sserial, arg)
+				drop_chan <- 1
 			case queue <- message:
+				// (handled by receiver of 'queue')
 			default:
-				log.Printf("%s DROP %s", sserial, arg)
+				log.Printf("%s DROP %s (reason: queue is full)", sserial, arg)
 			}
 
 			serial++
@@ -200,6 +206,8 @@ func main() {
 	signal_chan := make(chan os.Signal)
 	signal.Notify(signal_chan, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
 	<-signal_chan
+
+	drop_chan <- 1
 
 	for i := 0; i < *n_processes; i++ {
 		worker_shutdown <- 1
