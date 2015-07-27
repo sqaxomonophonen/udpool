@@ -188,7 +188,7 @@ func main() {
 			}
 			arg := string(b[:rd])
 			message := Message{ sserial: sserial, argument: arg }
-			log.Printf("%s ACPT %s", sserial, arg)
+			log.Printf("%s READ %s", sserial, arg)
 			select {
 			case <-drop_chan:
 				log.Printf("%s DROP %s (reason: quitting)", sserial, arg)
