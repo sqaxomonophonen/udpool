@@ -5,12 +5,12 @@ import "os"
 import "os/signal"
 import "flag"
 import "net"
-import "sync"
 import "os/exec"
 import "syscall"
 import "log"
 import "time"
 import "strings"
+import "sync"
 
 func AssertFileIsExecutable(path string) {
 	file, err := os.Open(path)
@@ -99,69 +99,71 @@ func main() {
 		argument string
 	}
 
-	var wait_group sync.WaitGroup
 	queue := make(chan Message, *backlog)
-	worker_shutdown := make(chan int)
+
+	var child_process_group sync.WaitGroup
 
 	for i := 0; i < *n_processes; i++ {
-		wait_group.Add(1)
+		child_process_group.Add(1)
 		go func(process_id int) {
+			defer child_process_group.Done()
+
 			log.Printf("[n/a] INFO worker #%d starts", process_id)
+
 			for {
-				select {
-				case msg := <-queue:
-					log.Printf("%s EXEC %s %s", msg.sserial, *server, msg.argument)
-					cmd := exec.Command(*server, msg.argument)
+				msg, ok := <-queue
 
-					type ExitStatus struct {
-						state os.ProcessState
-						output []byte
-						err error
-					}
-
-					exit_status_chan := make(chan ExitStatus)
-
-					go func() {
-						output, err := cmd.CombinedOutput()
-						exit_status_chan <- ExitStatus { state: *cmd.ProcessState, output: output, err: err }
-					}()
-
-					var exit_status ExitStatus
-					if process_timeout_enabled {
-						Exit:
-						for {
-							for i := 0; i < 2; i++ {
-								select {
-								case exit_status = <-exit_status_chan:
-									break Exit
-								case <-time.After(process_timeout_durations[i]):
-									log.Printf("%s %s %s %s", msg.sserial, signal_names[i], *server, msg.argument)
-									cmd.Process.Signal(signals[i])
-								}
-							}
-							exit_status = <-exit_status_chan
-							break Exit
-						}
-					} else {
-						exit_status = <-exit_status_chan
-					}
-
-					if exit_status.state.Success() {
-						log.Printf("%s DONE %s %s", msg.sserial, *server, msg.argument)
-					} else {
-						log.Printf(
-							"%s FAIL %s %s (%s) :: %d bytes of output: %s",
-							msg.sserial,
-							*server,
-							msg.argument,
-							exit_status.err,
-							len(exit_status.output),
-							exit_status.output)
-					}
-				case <-worker_shutdown:
-					wait_group.Done()
+				if !ok {
 					log.Printf("[n/a] INFO worker #%d quits", process_id)
 					return
+				}
+
+				log.Printf("%s EXEC %s %s", msg.sserial, *server, msg.argument)
+				cmd := exec.Command(*server, msg.argument)
+
+				type ExitStatus struct {
+					state os.ProcessState
+					output []byte
+					err error
+				}
+
+				exit_status_chan := make(chan ExitStatus)
+
+				go func() {
+					output, err := cmd.CombinedOutput()
+					exit_status_chan <- ExitStatus { state: *cmd.ProcessState, output: output, err: err }
+				}()
+
+				var exit_status ExitStatus
+				if process_timeout_enabled {
+					Exit: for {
+						for i := 0; i < 2; i++ {
+							select {
+							case exit_status = <-exit_status_chan:
+								break Exit
+							case <-time.After(process_timeout_durations[i]):
+								log.Printf("%s %s %s %s", msg.sserial, signal_names[i], *server, msg.argument)
+								cmd.Process.Signal(signals[i])
+							}
+						}
+						exit_status = <-exit_status_chan
+						break Exit
+					}
+				} else {
+					exit_status = <-exit_status_chan
+				}
+
+				if exit_status.state.Success() {
+					log.Printf("%s DONE %s %s", msg.sserial, *server, msg.argument)
+				} else {
+					log.Printf(
+						"%s FAIL %s %s (%s) :: %d bytes of output: %s",
+						msg.sserial,
+						*server,
+						msg.argument,
+						exit_status.err,
+						len(exit_status.output),
+						exit_status.output)
 				}
 			}
 		}(i)
@@ -187,13 +189,20 @@ func main() {
 				os.Exit(1)
 			}
 			arg := string(b[:rd])
-			message := Message{ sserial: sserial, argument: arg }
 			log.Printf("%s READ %s", sserial, arg)
+
+			message := Message{ sserial: sserial, argument: arg }
+
 			select {
 			case <-drop_chan:
 				log.Printf("%s DROP %s (reason: quitting)", sserial, arg)
 				drop_chan <- 1
-			case queue <- message:
+				continue
+			default:
+			}
+
+			select {
+			case queue <-message:
 				// (handled by receiver of 'queue')
 			default:
 				log.Printf("%s DROP %s (reason: queue is full)", sserial, arg)
@@ -209,9 +218,7 @@ func main() {
 
 	drop_chan <- 1
 
-	for i := 0; i < *n_processes; i++ {
-		worker_shutdown <- 1
-	}
+	close(queue)
 
-	wait_group.Wait()
+	child_process_group.Wait()
 }
