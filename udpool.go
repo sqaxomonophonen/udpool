@@ -10,6 +10,7 @@ import "syscall"
 import "log"
 import "time"
 import "strings"
+import "strconv"
 import "sync"
 
 func AssertFileIsExecutable(path string) {
@@ -30,43 +31,86 @@ func AssertFileIsExecutable(path string) {
 	file.Close()
 }
 
-func ParseTimeoutArgument(process_timeout string) (bool, [2]time.Duration) {
-	process_timeout_enabled := false
+func GetSignalNameMap() (map[string]syscall.Signal) {
+	return map[string]syscall.Signal {
+		"HUP": syscall.SIGHUP,
+		"INT": syscall.SIGINT,
+		"QUIT": syscall.SIGQUIT,
+		"ILL": syscall.SIGILL,
+		"ABRT": syscall.SIGABRT,
+		"FPE": syscall.SIGFPE,
+		"KILL": syscall.SIGKILL,
+		"USR1": syscall.SIGUSR1,
+		"SEGV": syscall.SIGSEGV,
+		"USR2": syscall.SIGUSR2,
+		"PIPE": syscall.SIGPIPE,
+		"ALRM": syscall.SIGALRM,
+		"TERM": syscall.SIGTERM,
+	}
+}
 
-	var sigterm_timeout time.Duration
-	var sigkill_timeout time.Duration
+func GetSignalForSignalName(name string) (syscall.Signal) {
+	return GetSignalNameMap()[name]
+}
 
-	if process_timeout != "" {
-		parts := strings.Split(process_timeout, "/")
-		if len(parts) < 1 || len(parts) > 2 {
-			fmt.Fprintln(os.Stderr, "invalid timeout")
-			os.Exit(1)
+func GetSignalNameForSignal(signal syscall.Signal) (string) {
+	for k,v := range GetSignalNameMap() {
+		if signal == v {
+			return k
 		}
+	}
+	return "????"
+}
 
-		var e error
+type TimeoutAction struct {
+	duration time.Duration
+	signal syscall.Signal
+	signal_name string
+}
 
-		sigterm_timeout, e = time.ParseDuration(parts[0])
-		if e != nil {
-			fmt.Fprintln(os.Stderr, "invalid sigterm timeout")
-			os.Exit(1)
-		}
-
-		var sigkill_timeout_string string
-		sigkill_timeout_string = "1m"
-		if len(parts) == 2 {
-			sigkill_timeout_string = parts[1]
-		}
-
-		sigkill_timeout, e = time.ParseDuration(sigkill_timeout_string)
-		if e != nil {
-			fmt.Fprintln(os.Stderr, "invalid sigkill timeout")
-			os.Exit(1)
-		}
-
-		process_timeout_enabled = true
+func ParseTimeoutArgument(arg string) ([]TimeoutAction) {
+	if arg == "" {
+		return []TimeoutAction {}
 	}
 
-	return process_timeout_enabled, [2]time.Duration{sigterm_timeout, sigkill_timeout}
+	var e interface{}
+
+	action_strings := strings.Split(arg, "/")
+	ret := make([]TimeoutAction, len(action_strings))
+	for i,action_string := range action_strings {
+		parts := strings.Split(action_string, ":")
+		ret[i].duration, e = time.ParseDuration(parts[0])
+		if e != nil {
+			fmt.Fprintln(os.Stderr, "invalid timeout string '%s'", parts[0])
+			os.Exit(1)
+		}
+
+		if len(parts) == 1 {
+			ret[i].signal = syscall.SIGTERM
+			ret[i].signal_name = GetSignalNameForSignal(ret[i].signal)
+		} else if len(parts) == 2 {
+			n := parts[1]
+			var si uint64
+			si, e := strconv.ParseUint(n, 10, 8)
+			if e == nil {
+				ret[i].signal = syscall.Signal(si)
+				ret[i].signal_name = GetSignalNameForSignal(ret[i].signal)
+			} else {
+				n = strings.ToUpper(n)
+				if n[0:3] == "SIG" {
+					n = n[3:]
+				}
+				ret[i].signal_name = n
+				ret[i].signal = GetSignalForSignalName(ret[i].signal_name)
+
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, "invalid timeout string '%s'", parts[0])
+			os.Exit(1)
+		}
+	}
+
+	return ret
 }
 
 func main() {
@@ -74,16 +118,18 @@ func main() {
 	n_processes := flag.Int("processes", 32, "number of processes in process pool")
 	backlog := flag.Int("backlog", 32768, "how many messages can be enqueued before new messages are dropped")
 	server := flag.String("server", "", "path to server; executable which the process pool will consist of")
-	process_timeout := flag.String("timeout", "", "process timeout duration. e.g. '2h' " +
-		"(wait 2 hours, then SIGTERM, wait 1 minute, then SIGKILL) or '1m/1s' " +
-		"(wait 1 min, then SIGTERM, wait 1 second, then SIGKILL). " +
-		"Duration format is documented here: http://golang.org/pkg/time/#ParseDuration")
+	process_timeout := flag.String("timeout", "",
+			"Timeout signal actions. Default is no action; i.e. to never send any signals to child processes. " +
+			"Actions are separated by '/'. The format of each action is 'duration[:signal]'. Duration format " +
+			"is documented here: http://golang.org/pkg/time/#ParseDuration. Default signal is SIGTERM. " +
+			"Both signal number and signal name, with or without SIG- prefix, are allowed, i.e. " +
+			"'1h', '1h:SIGTERM, '1h:TERM' and '1h:15' all mean the same thing; wait one hour for the process " +
+			"to finish, then send SIGTERM. Actions are executed sequentially, e.g. '1h/1m:9' means " +
+			"\"wait one hour, then send SIGTERM, then wait 1 minute, then send SIGKILL\"")
 
 	flag.Parse()
 
-	process_timeout_enabled, process_timeout_durations := ParseTimeoutArgument(*process_timeout)
-	signals := [2]syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}
-	signal_names := [2]string{"TERM", "KILL"}
+	timeout_actions := ParseTimeoutArgument(*process_timeout)
 
 	if *server == "" {
 		fmt.Fprintln(os.Stderr, "a server must be specified")
@@ -135,22 +181,18 @@ func main() {
 				}()
 
 				var exit_status ExitStatus
-				if process_timeout_enabled {
-					Exit: for {
-						for i := 0; i < 2; i++ {
-							select {
-							case exit_status = <-exit_status_chan:
-								break Exit
-							case <-time.After(process_timeout_durations[i]):
-								log.Printf("%s %s %s %s", msg.sserial, signal_names[i], *server, msg.argument)
-								cmd.Process.Signal(signals[i])
-							}
+				Exit: for {
+					for _,timeout_action := range timeout_actions {
+						select {
+						case exit_status = <-exit_status_chan:
+							break Exit
+						case <-time.After(timeout_action.duration):
+							log.Printf("%s %s %s %s", msg.sserial, timeout_action.signal_name, *server, msg.argument)
+							cmd.Process.Signal(timeout_action.signal)
 						}
-						exit_status = <-exit_status_chan
-						break Exit
 					}
-				} else {
 					exit_status = <-exit_status_chan
+					break Exit
 				}
 
 				if exit_status.state.Success() {
